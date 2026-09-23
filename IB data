@@ -1,0 +1,159 @@
+import time  # to manage dates of our requests
+import numpy as np  # to manage the data we get from the server
+import pandas as pd  # save the data in a dataframe
+from datetime import datetime, timedelta  # to know when to stop stepping back
+from ibapi.client import Contract, EClient  # Python can make a request to TWS
+from ibapi.wrapper import EWrapper
+# to define the contract we want to request data for
+from ibapi.contract import Contract
+from threading import Thread  # run the main loop to recive data from the server
+
+
+# Step 2: Create a class for the IB API and Run functions to thread
+class IBKRApp(EWrapper, EClient):
+    def __init__(self):
+        EClient.__init__(self, self)
+        self.data = []
+        self.finished = False
+
+    def historicalData(self, reqId, bar):
+        self.data.append({
+            'datetime': bar.date,
+            'open': bar.open,
+            'high': bar.high,
+            'low': bar.low,
+            'close': bar.close,
+            'volume': bar.volume
+        })
+
+    def historicalDataEnd(self, reqId, start, end):
+        self.finished = True
+
+    def error(self, reqId, *args):
+        print(f"  -> IBKR message on reqId {reqId}: {args}")
+        if reqId != -1:
+            self.finished = True
+
+    def run_loop(self):
+        self.run()
+
+
+# Step 3: Create a function to pull deep history by stepping backward in chunks
+def get_equity_data(symbol="NVDA", sec_type="STK", total_years=0.5, bar_size="1 day", chunk_size="5 Y"):
+    app = IBKRApp()
+    app.connect('127.0.0.1', 7497, 123)
+    api_thread = Thread(target=app.run_loop)
+    api_thread.start()
+    time.sleep(1)
+
+    contract = Contract()
+    contract.symbol = symbol
+    contract.secType = sec_type
+    contract.exchange = "SMART"
+    contract.currency = "USD"
+    if sec_type == "IND":
+        contract.exchange = "CBOE"
+
+    all_chunks = []
+    current_end_date = ""
+    target_start = datetime.now() - timedelta(days=total_years * 365)
+    req_id = 1
+    max_chunks = 30
+
+    for _ in range(max_chunks):
+        print(
+            f"  -> Fetching chunk ending {current_end_date or 'NOW'} for {symbol}...")
+
+        app.data = []
+        app.finished = False
+
+        app.reqHistoricalData(
+            reqId=req_id,  # unique id for the request
+            contract=contract,  # the contract we want to request data for
+            endDateTime=current_end_date,  # steps backward each loop
+            durationStr="6 M",
+            barSizeSetting=bar_size,  # the size of the bars we want to get
+            whatToShow='TRADES',  # the type of data we want to get
+            useRTH=1,
+            formatDate=1,
+            keepUpToDate=False,
+            chartOptions=[]
+        )
+        req_id += 1
+
+        # wait for this chunk, but don't hang forever if something goes wrong
+        waited = 0
+        while not app.finished and waited < 60:
+            time.sleep(0.5)
+            waited += 0.5
+
+        if not app.data:  # no data came back -> we've hit the start of history or an error
+            print(f"  -> No more data for {symbol}, stopping.")
+            break
+
+        chunk_df = pd.DataFrame(app.data)
+        all_chunks.append(chunk_df)
+
+        # earliest bar in this chunk (first 8 chars = YYYYMMDD, ignores any time/tz suffix)
+        earliest_str = str(chunk_df['datetime'].iloc[0]).strip()[:8]
+        earliest_dt = pd.to_datetime(
+            earliest_str, format='%Y%m%d', errors='coerce')
+
+        # stop once we've reached far enough back
+        if pd.isna(earliest_dt) or earliest_dt <= target_start:
+            break
+
+        # set the next request to end where this batch started
+        current_end_date = f"{earliest_str} 16:00:00"
+        time.sleep(2)  # respect IBKR pacing between requests
+
+    app.disconnect()
+
+    if not all_chunks:
+        print(f"Failed to fetch any data for {symbol}")
+        return pd.DataFrame()
+
+    # Combine every chunk, then clean
+    df = pd.concat(all_chunks, ignore_index=True)
+    df['datetime'] = pd.to_datetime(df['datetime'].str.slice(
+        0, 8), format='%Y%m%d', errors='coerce')
+    df = df.dropna(subset=['datetime'])
+    df = df.drop_duplicates(subset=['datetime']).sort_values(
+        'datetime').reset_index(drop=True)
+    # trim anything older than the window we asked for
+    df = df[df['datetime'] >= target_start]
+
+    # Calculate LOG returns (consistent with how we'll treat VIX later)
+    df['return'] = np.log(df['close'] / df['close'].shift(1))
+    df = df.dropna()  # drop the first row which has a NaN return
+
+    df = df[['datetime', 'open', 'high', 'low', 'close', 'volume', 'return']]
+    df.to_csv(f"{symbol}_{total_years}yr_data.csv", index=False)
+    print(f"Saved {symbol}_{total_years}yr_data.csv ({len(df)} rows)")
+    return df
+
+
+# Step 4: Run the function to get the data
+if __name__ == "__main__":
+    print("Starting deep historical data pull...")
+
+    # Market Benchmarks (the two regressors in R_i ~ R_SPX + dVIX)
+    spx_df = get_equity_data('SPX', sec_type='IND', total_years=0.5)
+    vix_df = get_equity_data('VIX', sec_type='IND', total_years=0.5)
+
+    # Individual stock basket (chosen for a SPREAD of betas / VIX sensitivities)
+    stocks = [
+        'AAPL', 'MSFT', 'NVDA', 'GOOGL',  # high-beta growth/tech
+        'WMT',                            # retail
+        'JPM',                            # financial: usually strong negative VIX loading
+        'XOM',                            # energy / cyclical
+        'KO', 'JNJ'                       # defensive staples: low beta, muted VIX sensitivity
+    ]
+
+    stock_data = {}
+    for symbol in stocks:
+        stock_data[symbol] = get_equity_data(
+            symbol, sec_type='STK', total_years=0.5)
+        time.sleep(3)  # extra pacing between symbols
+
+    print("All deep historical data tasks processed.")
